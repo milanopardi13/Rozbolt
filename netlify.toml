@@ -1,1 +1,11 @@
+# Netlify configuration — Next.js is handled natively by the OpenNext runtime.
+# https://opennext.js.org/netlify
 
+[build]
+  command = "npm run build"
+
+[build.environment]
+  NODE_VERSION = "20"
+
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
