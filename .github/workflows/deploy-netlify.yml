@@ -1,21 +1,10 @@
-
-# Full production deploy via GitHub Actions — no dashboard clicking after setup.
-#
-# Required repository secret:
-#   NETLIFY_AUTH_TOKEN        (app.netlify.com → User settings → Personal access tokens)
-# Optional repository secrets:
-#   NETLIFY_SITE_ID           skips site discovery/creation
-#   NETLIFY_ADMIN_EMAIL       → ADMIN_EMAIL on the site (admin login)
-#   NETLIFY_ADMIN_PASSWORD    → ADMIN_PASSWORD on the site (admin login)
-#   NETLIFY_AUTH_SECRET       → AUTH_SECRET (session signing; auto-generated once if absent)
-#   NETLIFY_UPSTASH_URL / NETLIFY_UPSTASH_TOKEN
-#                             → Upstash Redis so admin content edits persist (recommended)
+name: Deploy to Netlify
 
 on:
   push:
     branches: [main]
     paths-ignore:
-      - "README.md"
+      - README.md
   workflow_dispatch:
 
 concurrency:
@@ -24,115 +13,118 @@ concurrency:
 
 jobs:
   deploy:
-    name: Build & deploy to Netlify (production)
-    runs-on: ubuntu-latest
-    # Silently no-op until NETLIFY_AUTH_TOKEN is configured.
+    name: Build and deploy to Netlify
     if: ${{ secrets.NETLIFY_AUTH_TOKEN != '' }}
+    runs-on: ubuntu-latest
     env:
       NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
       SITE_NAME_DEFAULT: rosie-atelier-milanopardi13
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 20
-
       - name: Install dependencies
-        # --no-save: the Next.js runtime plugin is needed only for the CI build;
-        # no changes to package.json / package-lock.json are required in the repo.
-        run: npm ci && npm install @netlify/plugin-nextjs@latest --no-save
-
+        run: |
+          npm ci
+          npm install @netlify/plugin-nextjs@latest --no-save
       - name: Install Netlify CLI
         run: npm install -g netlify-cli@latest
-
-      - name: Find or create Netlify project
+      - name: Find or create Netlify site
         id: site
+        env:
+          NETLIFY_SITE_ID_OVERRIDE: ${{ secrets.NETLIFY_SITE_ID }}
         run: |
-          SITE_ID="${{ secrets.NETLIFY_SITE_ID }}"
-          if [ -z "$SITE_ID" ]; then
-            SITE_ID=$(netlify sites:list --json 2>/dev/null \
-              | jq -r --arg n "$SITE_NAME_DEFAULT" '.[] | select(.name==$n) | (.site_id // .id)' | head -1)
+          set -euo pipefail
+          site_id="$NETLIFY_SITE_ID_OVERRIDE"
+          if [ -z "$site_id" ]; then
+            site_id=$(netlify sites:list --json 2>/dev/null | jq -r --arg name "$SITE_NAME_DEFAULT" '.[] | select(.name == $name) | (.site_id // .id)' | head -n 1)
           fi
-          if [ -z "$SITE_ID" ]; then
-            echo "Creating project '$SITE_NAME_DEFAULT'…"
-            CREATED=$(netlify sites:create --name "$SITE_NAME_DEFAULT" --disable-linking --json 2>/dev/null \
-                      | jq -r '.site_id // .id // empty')
-            if [ -z "$CREATED" ]; then
-              SUFFIXED="${SITE_NAME_DEFAULT}-$(date +%s)"
-              echo "Name taken — trying '$SUFFIXED'…"
-              CREATED=$(netlify sites:create --name "$SUFFIXED" --disable-linking --json \
-                        | jq -r '.site_id // .id // empty')
-              echo "::warning::Site created as '$SUFFIXED'. To avoid duplicate sites, save this id as the NETLIFY_SITE_ID repository secret: $CREATED"
+          if [ -z "$site_id" ]; then
+            echo "Creating Netlify site $SITE_NAME_DEFAULT"
+            created=$(netlify sites:create --name "$SITE_NAME_DEFAULT" --disable-linking --json 2>/dev/null | jq -r '.site_id // .id // empty' || true)
+            if [ -z "$created" ]; then
+              suffix="${SITE_NAME_DEFAULT}-$(date +%s)"
+              echo "The default site name was unavailable; retrying as $suffix"
+              created=$(netlify sites:create --name "$suffix" --disable-linking --json | jq -r '.site_id // .id // empty')
+              echo "::warning::Site created as $suffix. Save its id as the NETLIFY_SITE_ID repository secret to skip lookup: $created"
             fi
-            SITE_ID="$CREATED"
+            site_id="$created"
           fi
-          if [ -z "$SITE_ID" ]; then echo "::error::Could not create or find a Netlify site"; exit 1; fi
-          echo "site_id=$SITE_ID" >> "$GITHUB_OUTPUT"
-          netlify link --id "$SITE_ID"
-          echo "Linked to site $SITE_ID"
-
-      - name: Configure environment variables
+          if [ -z "$site_id" ]; then
+            echo "::error::Could not find or create a Netlify site"
+            exit 1
+          fi
+          echo "site_id=$site_id" >> "$GITHUB_OUTPUT"
+          netlify link --id "$site_id"
+      - name: Configure site environment
+        env:
+          REPO_AUTH_SECRET: ${{ secrets.NETLIFY_AUTH_SECRET }}
+          REPO_ADMIN_EMAIL: ${{ secrets.NETLIFY_ADMIN_EMAIL }}
+          REPO_ADMIN_PASSWORD: ${{ secrets.NETLIFY_ADMIN_PASSWORD }}
+          REPO_UPSTASH_URL: ${{ secrets.NETLIFY_UPSTASH_URL }}
+          REPO_UPSTASH_TOKEN: ${{ secrets.NETLIFY_UPSTASH_TOKEN }}
         run: |
-          set -u
-          site_env() { netlify env:get "$1" >/dev/null 2>&1; }
-          set_env()  { netlify env:set "$1" "$2" >/dev/null; echo "  ✔ $1"; }
-          # Session signing secret — generate once, then keep.
-          if [ -n "${{ secrets.NETLIFY_AUTH_SECRET }}" ]; then
-            set_env AUTH_SECRET "${{ secrets.NETLIFY_AUTH_SECRET }}"
-          elif ! site_env AUTH_SECRET; then
-            echo "Generating AUTH_SECRET (persisted on the site, reused across deploys)…"
-            set_env AUTH_SECRET "$(openssl rand -hex 32)"
+          set -euo pipefail
+          set_site_env() {
+            netlify env:set "$1" "$2" >/dev/null
+            echo "Configured $1"
+          }
+          if [ -n "$REPO_AUTH_SECRET" ]; then
+            set_site_env AUTH_SECRET "$REPO_AUTH_SECRET"
+          elif netlify env:get AUTH_SECRET >/dev/null 2>&1; then
+            echo "AUTH_SECRET already exists on the site"
           else
-            echo "AUTH_SECRET already present on site — leaving as-is."
+            set_site_env AUTH_SECRET "$(openssl rand -hex 32)"
           fi
-          # Admin account (only overwrite when the secrets are provided)
-          if [ -n "${{ secrets.NETLIFY_ADMIN_EMAIL }}" ]; then
-            set_env ADMIN_EMAIL "${{ secrets.NETLIFY_ADMIN_EMAIL }}"
+          if [ -n "$REPO_ADMIN_EMAIL" ]; then set_site_env ADMIN_EMAIL "$REPO_ADMIN_EMAIL"; fi
+          if [ -n "$REPO_ADMIN_PASSWORD" ]; then set_site_env ADMIN_PASSWORD "$REPO_ADMIN_PASSWORD"; fi
+          if ! netlify env:get ADMIN_EMAIL >/dev/null 2>&1 || ! netlify env:get ADMIN_PASSWORD >/dev/null 2>&1; then
+            echo "::warning::Production admin login is disabled because ADMIN_EMAIL and ADMIN_PASSWORD are not both configured"
           fi
-          if [ -n "${{ secrets.NETLIFY_ADMIN_PASSWORD }}" ]; then
-            set_env ADMIN_PASSWORD "${{ secrets.NETLIFY_ADMIN_PASSWORD }}"
-          fi
-          if ! site_env ADMIN_EMAIL || ! site_env ADMIN_PASSWORD; then
-            echo "::warning::ADMIN_EMAIL/ADMIN_PASSWORD not set — the production admin login will be disabled. Add NETLIFY_ADMIN_EMAIL + NETLIFY_ADMIN_PASSWORD repository secrets (or set the env vars in the Netlify dashboard) if you want the admin panel."
-          fi
-          # Optional persistence: Upstash Redis (Netlify FS is read-only at runtime)
-          if [ -n "${{ secrets.NETLIFY_UPSTASH_URL }}" ] && [ -n "${{ secrets.NETLIFY_UPSTASH_TOKEN }}" ]; then
-            set_env UPSTASH_REDIS_REST_URL "${{ secrets.NETLIFY_UPSTASH_URL }}"
-            set_env UPSTASH_REDIS_REST_TOKEN "${{ secrets.NETLIFY_UPSTASH_TOKEN }}"
-            echo "Persistence: Upstash Redis ✔"
+          if [ -n "$REPO_UPSTASH_URL" ] && [ -n "$REPO_UPSTASH_TOKEN" ]; then
+            set_site_env UPSTASH_REDIS_REST_URL "$REPO_UPSTASH_URL"
+            set_site_env UPSTASH_REDIS_REST_TOKEN "$REPO_UPSTASH_TOKEN"
           else
-            echo "::notice::No Upstash credentials — admin content edits will NOT persist across deploys (read-only FS). Optional: free tier at upstash.com."
+            echo "::notice::Admin content edits will not persist across deploys without both Upstash credentials"
           fi
-
-      - name: Build & deploy to production
+      - name: Deploy to production
         id: deploy
         run: |
-          OUT=$(netlify deploy --build --prod --message "GitHub Actions run #${{ github.run_number }} (${{ github.sha }})" 2>&1)
-          echo "$OUT" | tail -30
-          echo "$OUT" | grep -qiE "Build complete|Deploying|success" || { echo "::error::netlify deploy failed"; exit 1; }
-          URL=$(netlify sites:list --json 2>/dev/null \
-                | jq -r --arg id "${{ steps.site.outputs.site_id }}" \
-                  '.[] | select((.site_id // .id)==$id) | (.ssl_url // .url)' | head -1)
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-
+          set -euo pipefail
+          output=$(netlify deploy --build --prod --message "GitHub Actions run #${{ github.run_number }} (${{ github.sha }})" 2>&1) || {
+            printf '%s\n' "$output"
+            echo "::error::Netlify deploy failed"
+            exit 1
+          }
+          printf '%s\n' "$output" | tail -n 30
+          if printf '%s\n' "$output" | grep -qiE '(^|[^[:alnum:]])(error|failed)([^[:alnum:]]|$)'; then
+            echo "::error::Netlify deploy output indicates an error"
+            exit 1
+          fi
+          live_url=$(netlify sites:list --json 2>/dev/null | jq -r --arg id "${{ steps.site.outputs.site_id }}" '.[] | select((.site_id // .id) == $id) | (.ssl_url // .url)' | head -n 1)
+          if [ -z "$live_url" ]; then echo "::error::Could not resolve the public Netlify URL"; exit 1; fi
+          echo "url=$live_url" >> "$GITHUB_OUTPUT"
       - name: Smoke test
         if: steps.deploy.outputs.url != ''
         run: |
-          URL="${{ steps.deploy.outputs.url }}"
-          for i in 1 2 3 4 5; do
-            code=$(curl -sfL -o /dev/null -w '%{http_code}' "$URL/fa" 2>/dev/null || echo 0)
-            [ "$code" = "200" ] && echo "OK: $URL/fa → 200" && exit 0
-            echo "attempt $i: got $code — retrying in 10s…"; sleep 10
+          set -euo pipefail
+          url="${{ steps.deploy.outputs.url }}"
+          for attempt in 1 2 3 4 5; do
+            code=$(curl -sfL -o /dev/null -w '%{http_code}' "$url/fa" 2>/dev/null || true)
+            if [ "$code" = "200" ]; then echo "Smoke test passed: $url/fa"; exit 0; fi
+            echo "Smoke test attempt $attempt returned HTTP $code"
+            [ "$attempt" = "5" ] || sleep 10
           done
-          echo "::warning::Site not answering 200 yet on $URL/fa"
-
-      - name: Summary
+          echo "::error::Smoke test failed: $url/fa did not return HTTP 200"
+          exit 1
+      - name: Publish deployment summary
         if: always()
         run: |
-          URL="${{ steps.deploy.outputs.url }}"
           {
-            echo "## 🚀 Netlify deploy"
-            [ -n "$URL" ] && echo "Live: **$URL** (homepage: $URL/fa)"
-            echo "Site ID: \`${{ steps.site.outputs.site_id }}\` (save as NETLIFY_SITE_ID secret to skip lookup)"
+            echo "## Netlify deploy"
+            if [ -n "${{ steps.deploy.outputs.url }}" ]; then echo "Live URL: ${{ steps.deploy.outputs.url }}"; fi
+            echo "Site ID: ${{ steps.site.outputs.site_id }} (save it as NETLIFY_SITE_ID to skip lookup)"
           } >> "$GITHUB_STEP_SUMMARY"
