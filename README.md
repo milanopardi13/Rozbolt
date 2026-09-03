@@ -86,6 +86,21 @@ portfolio/education flags & ordering, banners, SEO. Every save is live immediate
 
 Every push to the connected branch redeploys automatically. Copy `.env.example` to `.env.local` for local runs.
 
+### CI deploy (GitHub Actions → Vercel) — zero dashboard work after setup
+
+This repo ships `.github/workflows/deploy-vercel.yml`. It creates/links the Vercel project
+`rozbolt`, syncs env vars and deploys `--prod` on every push to `main` (or manually via
+**Actions → Deploy to Vercel → Run workflow**).
+
+One-time setup (5 minutes, once):
+1. Create a free Vercel account (sign in with GitHub at vercel.com).
+2. Create a token at **vercel.com/account/tokens** (e.g. `rozbolt-deploy`).
+3. In this repo: **Settings → Secrets and variables → Actions → New repository secret**, add:
+   - `VERCEL_API_TOKEN` (required)
+   - `VERCEL_ADMIN_EMAIL`, `VERCEL_ADMIN_PASSWORD` (your admin login for the live site)
+   - optional: `VERCEL_SCOPE` (team slug), `VERCEL_AUTH_SECRET` (else generated once, then kept)
+4. That's it — every push redeploys automatically.
+
 ### Other hosts (VPS / Docker / Liara / etc.)
 
 `npm ci && npm run build && npm start` on Node 20+. Set the same env vars; without Redis/Blob, content persists
